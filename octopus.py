@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-Octopus: Remote Signal Aggregator & Execution Engine.
-Fetches signals from 'https://workspace-production-9fae.up.railway.app/predictions'
-- REMOVED: HTML Scraping, Regex Parsing.
-- ADDED: JSON API Integration.
-- UPDATED: Sizing Formula (Equity * Leverage * Sum / TradedAssets).
-- UPDATED: Execution Logic (Dynamic Remainder, 210s Duration, 10s Intervals).
-- ADDED: Custom print function with 0.1s delay.
-- UPDATED: Component-based Signal Calculation (Precise Timeframe Logic).
+Try3: Execution Engine
+- Base: Octopus (Architecture)
+- Logic: Model2xx (8 Limit Steps + 1 Market Sweep)
+- Signals: Multi-URL (try3{asset})
+- Schedule: Hourly @ :15s
 """
 
 import os
@@ -15,15 +12,16 @@ import sys
 import time
 import logging
 import requests
+import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 # --- Local Imports ---
 try:
     from kraken_futures import KrakenFuturesApi
-except ImportError as e:
-    print(f"CRITICAL: Import failed: {e}. Ensure 'kraken_futures.py' is in the directory.")
+except ImportError:
+    print("CRITICAL: 'kraken_futures.py' not found.")
     sys.exit(1)
 
 # --- Configuration ---
@@ -38,229 +36,177 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-LEVERAGE = 0
-SIGNAL_FEED_URL = "https://workspace-production-9fae.up.railway.app/predictions"
+LEVERAGE = 1.0
+MAX_WORKERS = 3  # For BTC, XRP, SOL
 
-# Asset Mapping (Feed Symbol -> Kraken Futures Perpetual)
-SYMBOL_MAP = {
-    # --- Majors ---
-    "BTCUSDT": "ff_xbtusd_260327",
-    "ETHUSDT": "pf_ethusd",
-    "SOLUSDT": "pf_solusd",
-    "BNBUSDT": "pf_bnbusd",
-    "XRPUSDT": "pf_xrpusd",
-    "ADAUSDT": "pf_adausd",
-    
-    # --- Alts ---
-    "DOGEUSDT": "pf_dogeusd",
-    "AVAXUSDT": "pf_avaxusd",
-    "DOTUSDT": "pf_dotusd",
-    "LINKUSDT": "pf_linkusd",
-    "TRXUSDT": "pf_trxusd",
-    "BCHUSDT": "pf_bchusd",
-    "XLMUSDT": "pf_xlmusd",
-    "LTCUSDT": "pf_ltcusd",
-    "SUIUSDT": "pf_suiusd",
-    "HBARUSDT": "pf_hbarusd",
-    "SHIBUSDT": "pf_shibusd", 
-    "TONUSDT": "pf_tonusd",
-    "UNIUSDT": "pf_uniusd",
-    "ZECUSDT": "pf_zecusd",
+# Signal Sources
+# Maps the internal asset ticker to the specific Railway URL
+SIGNAL_URLS = {
+    "BTC": "https://try3btc.up.railway.app/api/current",
+    "XRP": "https://try3xrp.up.railway.app/api/current",
+    "SOL": "https://try3sol.up.railway.app/api/current"
 }
 
+# Asset Mapping (Internal Symbol -> Kraken Futures Symbol)
+# Using Perpetuals (pf_) for consistency. Change to ff_ if fixed maturity is desired.
+SYMBOL_MAP = {
+    "BTC": "pf_xbtusd",
+    "XRP": "pf_xrpusd",
+    "SOL": "pf_solusd",
+}
+
+# Execution Constants (From Model2xx)
+MAX_STEPS = 8           # 8 Limit Order updates
+STEP_INTERVAL = 5       # 5 seconds per step
+INITIAL_OFFSET = 0.0002 # 0.02% (2 bps)
+OFFSET_DECAY = 0.90     # Reduce offset by 10% per step
+
+# Logging Setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
-    handlers=[logging.FileHandler("octopus.log"), logging.StreamHandler(sys.stdout)]
+    handlers=[logging.FileHandler("try3.log"), logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("Octopus")
+logger = logging.getLogger("Try3")
+LOG_LOCK = threading.Lock()
+
+def bot_log(msg, level="info"):
+    """Thread-safe logging helper."""
+    with LOG_LOCK:
+        if level == "info": logger.info(msg)
+        elif level == "warning": logger.warning(msg)
+        elif level == "error": logger.error(msg)
+        # Custom delay not strictly necessary for functionality, but kept for readability if needed
+        # time.sleep(0.01) 
 
 # --- Signal Fetcher ---
 
-class SignalFetcher:
-    def __init__(self, url):
-        self.url = url
-
+class MultiSourceFetcher:
     def fetch_signals(self) -> Tuple[Dict[str, int], int]:
         """
-        Fetches JSON from the API and calculates the net vote based on candle closes.
-        Logic:
-        - 1d Close (00:00 UTC): Sum 5 (0-4)
-        - 4h Close (04:00..): Sum 4 (0-3)
-        - 1h Close (xx:00): Sum 3 (0-2)
-        - 30m Close (xx:30): Sum 2 (0-1)
-        - 15m Close (xx:15, xx:45): Sum 1 (0) -> Pure 15m signal
+        Fetches signals from individual asset URLs.
+        Returns: ({ 'BTC': 1, 'XRP': -1, ... }, valid_count)
         """
-        try:
-            logger.info(f"Fetching signals from {self.url}...")
-            resp = requests.get(self.url, timeout=10)
-            resp.raise_for_status()
-            
-            data = resp.json()
-            asset_votes = {}
-            traded_assets_count = len(data)
+        votes = {}
+        valid_count = 0
+        
+        bot_log(f"Fetching signals for {list(SIGNAL_URLS.keys())}...")
 
-            # Determine Logic Slice based on Current Time
-            now = datetime.now(timezone.utc)
-            
-            if now.minute == 0:
-                if now.hour == 0:
-                    # 1d Close: Include all 5 (0,1,2,3,4)
-                    slice_limit = 5
-                elif now.hour % 4 == 0:
-                    # 4h Close: Include 4 (0,1,2,3)
-                    slice_limit = 4
+        for asset, url in SIGNAL_URLS.items():
+            try:
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # Expecting: {"pred_dir": 0, "matches": 0, ...}
+                    # We use 'pred_dir' directly (-1, 0, 1)
+                    direction = int(data.get("pred_dir", 0))
+                    
+                    votes[asset] = direction
+                    valid_count += 1
+                    bot_log(f"[{asset}] Signal: {direction} (Matches: {data.get('matches', '?')})")
                 else:
-                    # 1h Close: Include 3 (0,1,2)
-                    slice_limit = 3
-            elif now.minute == 30:
-                # 30m Close: Include 2 (0,1) -> 15m + 30m
-                slice_limit = 2
-            else:
-                # 15m or 45m Close: Include 1 (0) -> 15m only
-                slice_limit = 1
-            
-            logger.info(f"Time: {now.strftime('%H:%M')} UTC | Slice Limit: {slice_limit} (Components)")
+                    bot_log(f"[{asset}] HTTP Error {resp.status_code}", level="warning")
+            except Exception as e:
+                bot_log(f"[{asset}] Fetch Failed: {e}", level="error")
+        
+        return votes, valid_count
 
-            for asset_name, metrics in data.items():
-                if asset_name not in SYMBOL_MAP:
-                    continue
-                
-                # Get components list, default to empty
-                comp = metrics.get("comp", [])
-                
-                if comp and isinstance(comp, list):
-                    # Sum the relevant components based on the calculated slice_limit
-                    # robustly handle cases where len(comp) < slice_limit
-                    valid_slice = min(len(comp), slice_limit)
-                    net_vote = sum(comp[:valid_slice])
-                else:
-                    # Fallback to pre-calculated sum if 'comp' is missing
-                    net_vote = int(metrics.get("sum", 0))
-                
-                asset_votes[asset_name] = net_vote
-            
-            logger.info(f"Parsed {len(asset_votes)} active assets from a universe of {traded_assets_count}.")
-            return asset_votes, traded_assets_count
+# --- Main Engine ---
 
-        except Exception as e:
-            logger.error(f"Failed to fetch signals: {e}")
-            return {}, 0
-
-# --- Main Octopus Engine ---
-
-class Octopus:
+class Try3Bot:
     def __init__(self):
         self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
-        self.fetcher = SignalFetcher(SIGNAL_FEED_URL)
-        self.executor = ThreadPoolExecutor(max_workers=5)
+        self.fetcher = MultiSourceFetcher()
+        self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
         self.instrument_specs = {}
 
-    def _log(self, msg: str, level: str = "info"):
-        """Custom print function with 0.1s delay."""
-        if level == "info":
-            logger.info(msg)
-        elif level == "warning":
-            logger.warning(msg)
-        elif level == "error":
-            logger.error(msg)
-        time.sleep(0.1)
-
     def initialize(self):
-        self._log("Initializing Octopus (JSON API Mode)...")
+        bot_log("--- Initializing Try3 Bot (Hourly/Model2xx Logic) ---")
         self._fetch_instrument_specs()
         
         # Connection Check
-        self._log("Checking API Connection...")
         try:
             acc = self.kf.get_accounts()
             if "error" in acc:
-                self._log(f"API Error: {acc}", level="error")
+                bot_log(f"API Error: {acc}", level="error")
+                sys.exit(1)
             else:
-                self._log("API Connection Successful.")
+                bot_log("API Connection Successful.")
         except Exception as e:
-            self._log(f"API Connection Failed: {e}", level="error")
-
-        self._log("Initialization Complete. Bot ready.")
+            bot_log(f"API Connection Failed: {e}", level="error")
+            sys.exit(1)
 
     def _fetch_instrument_specs(self):
+        """Fetches tick size and precision for all symbols."""
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/instruments"
             resp = requests.get(url).json()
             if "instruments" in resp:
                 for inst in resp["instruments"]:
-                    sym = inst["symbol"].lower()
-                    tick_size = float(inst.get("tickSize", 0.1))
-                    precision = inst.get("contractValueTradePrecision")
-                    size_step = 10 ** (-int(precision)) if precision is not None else 1.0
+                    sym = inst["symbol"].upper() # Store uppercase for matching
+                    precision = inst.get("contractValueTradePrecision", 3)
                     
                     self.instrument_specs[sym] = {
-                        "sizeStep": size_step,
-                        "tickSize": tick_size,
-                        "contractSize": float(inst.get("contractSize", 1.0))
+                        "sizeStep": 10 ** (-int(precision)) if precision is not None else 1.0,
+                        "tickSize": float(inst.get("tickSize", 0.1))
                     }
         except Exception as e:
-            self._log(f"Error fetching specs: {e}", level="error")
+            bot_log(f"Error fetching specs: {e}", level="error")
 
     def _round_to_step(self, value: float, step: float) -> float:
         if step == 0: return value
         rounded = round(value / step) * step
-        if isinstance(step, float) and "." in str(step):
-            decimals = len(str(step).split(".")[1])
-            rounded = round(rounded, decimals)
-        elif isinstance(step, int) or step.is_integer():
-            rounded = int(rounded)
-        return rounded
+        # Handle floating point errors slightly for clean logs
+        return float(f"{rounded:.10g}")
 
-    def _get_current_state(self, kf_symbol: str) -> Tuple[float, float]:
-        """Helper to get current position size and mark price."""
+    def _get_current_state(self, kf_symbol_upper: str) -> Tuple[float, float]:
+        """Gets position size and mark price. Returns (size, price)."""
         current_pos_size = 0.0
         mark_price = 0.0
         
-        # 1. Get Position
         try:
+            # 1. Get Position
             open_pos = self.kf.get_open_positions()
             if "openPositions" in open_pos:
                 for p in open_pos["openPositions"]:
-                    if p["symbol"].lower() == kf_symbol.lower():
+                    if p["symbol"].upper() == kf_symbol_upper:
                         size = float(p["size"])
                         if p["side"] == "short": size = -size
                         current_pos_size = size
                         break
-        except Exception as e:
-            self._log(f"[{kf_symbol}] Pos Fetch Error: {e}", level="error")
-            
-        # 2. Get Mark Price
-        try:
+                        
+            # 2. Get Mark Price
             tickers = self.kf.get_tickers()
             for t in tickers.get("tickers", []):
-                if t["symbol"].lower() == kf_symbol.lower():
+                if t["symbol"].upper() == kf_symbol_upper:
                     mark_price = float(t["markPrice"])
                     break
+                    
         except Exception as e:
-            self._log(f"[{kf_symbol}] Ticker Fetch Error: {e}", level="error")
+            bot_log(f"[{kf_symbol_upper}] State Fetch Error: {e}", level="error")
+            return 0.0, 0.0
             
         return current_pos_size, mark_price
 
     def run(self):
-        self._log("Bot started. Syncing with 15m intervals...")
+        bot_log("Bot started. Syncing to XX:00:15...")
         while True:
             now = datetime.now(timezone.utc)
             
-            # Trigger every 15 minutes at second 30
-            if now.minute % 15 == 0 and 30 <= now.second < 35:
-                self._log(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
-                self._process_signals()
-                time.sleep(50) 
+            # Trigger at Minute 0, Second 15
+            if now.minute == 0 and 15 <= now.second < 20:
+                bot_log(f">>> TRIGGER: {now.strftime('%H:%M:%S')} <<<")
+                self._process_cycle()
+                time.sleep(50) # Sleep to avoid double trigger
                 
-            time.sleep(1) 
+            time.sleep(1)
 
-    def _process_signals(self):
+    def _process_cycle(self):
         # 1. Fetch Signals
-        asset_votes, traded_assets_count = self.fetcher.fetch_signals()
+        votes, active_count = self.fetcher.fetch_signals()
         
-        if traded_assets_count == 0:
-            self._log("No assets found in feed. Skipping execution.", level="warning")
+        if active_count == 0:
+            bot_log("No active signals found. Skipping.", level="warning")
             return
 
         # 2. Get Account Equity
@@ -268,193 +214,134 @@ class Octopus:
             acc = self.kf.get_accounts()
             if "flex" in acc.get("accounts", {}):
                 equity = float(acc["accounts"]["flex"].get("marginEquity", 0))
-            elif "accounts" in acc:
-                first_acc = list(acc["accounts"].values())[0]
-                equity = float(first_acc.get("marginEquity", 0))
             else:
-                equity = 0
+                # Fallback for some account types
+                first_acc = list(acc.get("accounts", {}).values())[0]
+                equity = float(first_acc.get("marginEquity", 0))
                 
             if equity <= 0:
-                self._log("Equity 0. Aborting.", level="error")
+                bot_log("Equity <= 0. Aborting.", level="error")
                 return
         except Exception as e:
-            self._log(f"Account fetch failed: {e}", level="error")
+            bot_log(f"Account fetch failed: {e}", level="error")
             return
 
-        # 3. Calculate Unit Size
-        unit_size_usd = (equity * LEVERAGE) / traded_assets_count
-        self._log(f"Equity: ${equity:.2f} | Traded Assets: {traded_assets_count} | Unit Base: ${unit_size_usd:.2f}")
+        # 3. Calculate Base Unit (USD per Asset)
+        # Logic: If 3 assets active, each gets 1/3 * leverage * signal_direction
+        unit_usd = (equity * LEVERAGE) / active_count
+        bot_log(f"Equity: ${equity:.2f} | Assets: {active_count} | Unit: ${unit_usd:.2f}")
 
-        # 4. Execute per Asset
-        for asset, sum_val in asset_votes.items():
-            target_usd = unit_size_usd * sum_val
+        # 4. Execute concurrently
+        for asset, direction in votes.items():
+            if asset not in SYMBOL_MAP:
+                continue
+                
+            kf_symbol = SYMBOL_MAP[asset]
+            target_usd = unit_usd * direction # Can be negative (short)
             
-            if sum_val != 0:
-                self._log(f"[{asset}] Sum: {sum_val} -> Target Alloc: ${target_usd:.2f}")
-            
-            self.executor.submit(self._execute_single_asset_logic, asset, target_usd)
+            self.executor.submit(self._execute_dynamic_sequence, kf_symbol, target_usd)
 
-    def _execute_single_asset_logic(self, binance_asset: str, net_target_usd: float):
-        kf_symbol = SYMBOL_MAP.get(binance_asset)
-        if not kf_symbol: return
+    def _execute_dynamic_sequence(self, symbol_upper: str, target_usd: float):
+        """
+        Model2xx Execution Logic:
+        - 8 Limit Order updates (start passive, get aggressive)
+        - 1 Market Order sweep (if needed)
+        - Recalculates contracts needed based on Mark Price at every step
+        """
+        symbol_upper = symbol_upper.upper() # Strict Upper for Specs/Matching
+        symbol_lower = symbol_upper.lower() # Strict Lower for Order API
+        
+        specs = self.instrument_specs.get(symbol_upper)
+        if not specs:
+            bot_log(f"[{symbol_upper}] Specs missing. Skipping.", level="error")
+            return
 
-        try:
-            # Initial State Check to determine absolute target in contracts
-            current_pos, mark_price = self._get_current_state(kf_symbol)
+        order_id = None
+        current_offset = INITIAL_OFFSET
+        
+        bot_log(f"[{symbol_upper}] Logic Start. Target Value: ${target_usd:.2f}")
+
+        # --- Steps 1 to 8: Limit Orders ---
+        for step in range(MAX_STEPS):
+            # A. Get State
+            curr_pos, mark_price = self._get_current_state(symbol_upper)
             if mark_price == 0:
-                self._log(f"[{kf_symbol}] Mark price 0, skipping.", level="warning")
+                time.sleep(1)
+                continue
+
+            # B. Calculate Target Contracts
+            target_contracts = target_usd / mark_price
+            delta = target_contracts - curr_pos
+            
+            # C. Check Completion
+            if abs(delta) < specs["sizeStep"]:
+                bot_log(f"[{symbol_upper}] Target Reached (Delta: {delta:.4f}).")
+                if order_id: self._cancel_order(order_id, symbol_lower)
                 return
 
-            # Calculate Absolute Target in Contracts
-            target_contracts = net_target_usd / mark_price
+            # D. Order Parameters
+            side = "buy" if delta > 0 else "sell"
+            abs_delta = abs(delta)
+            size = self._round_to_step(abs_delta, specs["sizeStep"])
             
-            self._log(f"[{kf_symbol}] Logic Start. Curr: {current_pos:.4f} -> Target: {target_contracts:.4f}")
-            
-            self._execute_smooth_order(kf_symbol, target_contracts)
+            # Price Calculation
+            price_mult = (1 - current_offset) if side == "buy" else (1 + current_offset)
+            limit_price = self._round_to_step(mark_price * price_mult, specs["tickSize"])
 
-        except Exception as e:
-            self._log(f"[{kf_symbol}] Exec Error: {e}", level="error")
-
-    def _execute_smooth_order(self, symbol: str, target_contracts: float):
-        """
-        Executes orders smoothly:
-        1. Starts limit order 0.05% away.
-        2. Updates 21 times (every 10s) = 210s total duration.
-        3. CRITICAL: Re-calculates 'delta' (remaining needed) at every step.
-        4. If not filled at end, sends Market Order for the EXACT remaining delta.
-        """
-        
-        specs = self.instrument_specs.get(symbol.lower())
-        size_inc = specs['sizeStep'] if specs else 0.001
-        price_inc = specs['tickSize'] if specs else 0.01
-
-        # Execution parameters
-        # 21 steps * 10s = 210s total
-        TOTAL_STEPS = 21
-        STEP_INTERVAL = 10 
-        
-        START_OFFSET_PCT = 0.0005 # 0.05%
-        DECAY_FACTOR = 0.90 # Move 10% closer each step
-        
-        order_id = None
-        
-        # Loop for smooth limit execution
-        for i in range(TOTAL_STEPS):
+            # E. Place/Update Order
             try:
-                # 1. RE-CALCULATE REMAINDER (The "Remaining" Check)
-                curr_pos, curr_mark = self._get_current_state(symbol)
-                if curr_mark == 0: break
-
-                delta = target_contracts - curr_pos
-                
-                # Check if we are "reasonably close" (within 1 size increment)
-                if abs(delta) < size_inc:
-                    self._log(f"[{symbol}] Target reached (Delta: {delta}). Stopping.")
-                    if order_id: self.kf.cancel_order({"order_id": order_id, "symbol": symbol})
-                    return
-
-                # 2. Check Open Orders to detect fills
-                # If order exists locally but not in API, it must have filled fully
-                if order_id:
-                    open_orders = self.kf.get_open_orders()
-                    is_open = False
-                    if "openOrders" in open_orders:
-                        for o in open_orders["openOrders"]:
-                            if o["order_id"] == order_id:
-                                is_open = True
-                                break
-                    
-                    if not is_open:
-                        self._log(f"[{symbol}] Order {order_id} not found/filled. Recalculating.")
-                        order_id = None
-                        # Continue to next loop to re-measure 'delta' with new position
-                        continue 
-
-                # 3. Calculate Price & Size
-                current_offset = START_OFFSET_PCT * (DECAY_FACTOR ** i)
-                
-                side = "buy" if delta > 0 else "sell"
-                if side == "buy":
-                    # Buy Limit below mark
-                    limit_price = curr_mark * (1 - current_offset)
-                else:
-                    # Sell Limit above mark
-                    limit_price = curr_mark * (1 + current_offset)
-
-                limit_price = self._round_to_step(limit_price, price_inc)
-                
-                # STRICTLY USE REMAINDER AS SIZE
-                order_size = self._round_to_step(abs(delta), size_inc)
-
-                if order_size < size_inc:
-                    continue
-
-                # 4. Place or Edit Order
-                if order_id is None:
-                    # New Order
-                    self._log(f"[{symbol}] Placing Limit {side.upper()} @ {limit_price} Size: {order_size} (Offset: {current_offset*100:.4f}%)")
+                if not order_id:
                     resp = self.kf.send_order({
-                        "orderType": "lmt",
-                        "symbol": symbol,
-                        "side": side,
-                        "size": order_size,
-                        "limitPrice": limit_price
+                        "orderType": "lmt", "symbol": symbol_lower, "side": side,
+                        "size": size, "limitPrice": limit_price
                     })
                     if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                         order_id = resp["sendStatus"]["order_id"]
-                    else:
-                        self._log(f"[{symbol}] Limit Order Failed: {resp}", level="warning")
+                        bot_log(f"[{symbol_upper}] Step {step+1}: Placed {side} {size} @ {limit_price}")
                 else:
-                    # Edit Order - Updates Size to match current remainder
-                    self._log(f"[{symbol}] Updating Limit @ {limit_price} Size: {order_size} (Remaining)")
-                    resp = self.kf.edit_order({
-                        "orderId": order_id,
-                        "limitPrice": limit_price,
-                        "size": order_size,
-                        "symbol": symbol
+                    self.kf.edit_order({
+                        "orderId": order_id, "symbol": symbol_lower,
+                        "limitPrice": limit_price, "size": size
                     })
-                    if "editStatus" in resp and "status" in resp["editStatus"]:
-                         if resp["editStatus"]["status"] != "edited":
-                             # Order likely filled or cancelled during edit
-                             order_id = None
-
-                # Wait between updates
-                time.sleep(STEP_INTERVAL)
-
             except Exception as e:
-                self._log(f"[{symbol}] Limit Loop Error: {e}", level="error")
-                time.sleep(1)
+                bot_log(f"[{symbol_upper}] Order Update Failed: {e}", level="warning")
+                order_id = None # Assume filled or lost, reset for next loop
 
-        # --- End of Loop Cleanup ---
-        if order_id:
-            try:
-                self.kf.cancel_order({"order_id": order_id, "symbol": symbol})
-            except: pass
+            # F. Decay & Wait
+            current_offset *= OFFSET_DECAY
+            time.sleep(STEP_INTERVAL)
 
-        # --- Final Market Fallback (Remainder Only) ---
-        try:
-            # RE-CALCULATE REMAINDER FINAL TIME
-            curr_pos, _ = self._get_current_state(symbol)
-            final_delta = target_contracts - curr_pos
+        # --- Step 9: Market Sweep ---
+        if order_id: self._cancel_order(order_id, symbol_lower)
+        time.sleep(0.5)
+        
+        # Final Check
+        curr_pos, mark_price = self._get_current_state(symbol_upper)
+        if mark_price > 0:
+            target_contracts = target_usd / mark_price
+            delta = target_contracts - curr_pos
             
-            if abs(final_delta) >= size_inc:
-                self._log(f"[{symbol}] Limit Loop Done (210s). MKT Execute Remaining: {final_delta:.4f}")
-                side = "buy" if final_delta > 0 else "sell"
-                final_size = self._round_to_step(abs(final_delta), size_inc)
-                
-                self.kf.send_order({
-                    "orderType": "mkt",
-                    "symbol": symbol,
-                    "side": side,
-                    "size": final_size
-                })
+            if abs(delta) >= specs["sizeStep"]:
+                side = "buy" if delta > 0 else "sell"
+                size = self._round_to_step(abs(delta), specs["sizeStep"])
+                bot_log(f"[{symbol_upper}] SWEEPING MKT: {side} {size} (Delta: {delta:.4f})")
+                try:
+                    self.kf.send_order({
+                        "orderType": "mkt", "symbol": symbol_lower,
+                        "side": side, "size": size
+                    })
+                except Exception as e:
+                    bot_log(f"[{symbol_upper}] Sweep Failed: {e}", level="error")
             else:
-                self._log(f"[{symbol}] Target Reached. No Market Order needed.")
+                bot_log(f"[{symbol_upper}] Sweep not needed. Done.")
 
-        except Exception as e:
-            self._log(f"[{symbol}] Market Fallback Error: {e}", level="error")
+    def _cancel_order(self, order_id, symbol_lower):
+        try:
+            self.kf.cancel_order({"order_id": order_id, "symbol": symbol_lower})
+        except:
+            pass
 
 if __name__ == "__main__":
-    bot = Octopus()
+    bot = Try3Bot()
     bot.initialize()
     bot.run()
