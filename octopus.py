@@ -36,7 +36,7 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-LEVERAGE = 1.0
+LEVERAGE = 5
 MAX_WORKERS = 4  # Increased for BTC, XRP, SOL, DOGE
 
 # Signal Sources
@@ -217,8 +217,9 @@ class Try3Bot:
             return
 
         # 3. Calculate Base Unit
-        unit_usd = (equity * LEVERAGE) / active_count if active_count > 0 else 0
-        bot_log(f"Equity: ${equity:.2f} | Active Assets: {active_count}")
+        # Modified: Set position size to marginEquity * leverage directly
+        unit_usd = equity * LEVERAGE
+        bot_log(f"Equity: ${equity:.2f} | Active Assets: {active_count} | Unit Size: ${unit_usd:.2f}")
 
         # 4. Execute concurrently
         for asset, data in votes.items():
