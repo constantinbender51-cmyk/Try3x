@@ -37,13 +37,14 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
 LEVERAGE = 1.0
-MAX_WORKERS = 3  # For BTC, XRP, SOL
+MAX_WORKERS = 4  # Increased for BTC, XRP, SOL, DOGE
 
 # Signal Sources
 SIGNAL_URLS = {
     "BTC": "https://try3btc.up.railway.app/api/current",
     "XRP": "https://try3xrp.up.railway.app/api/current",
-    "SOL": "https://try3sol.up.railway.app/api/current"
+    "SOL": "https://try3sol.up.railway.app/api/current",
+    "DOGE": "https://try3doge.up.railway.app/api/current"
 }
 
 # Asset Mapping (Internal Symbol -> Kraken Futures Symbol)
@@ -51,11 +52,12 @@ SYMBOL_MAP = {
     "BTC": "pf_xbtusd",
     "XRP": "pf_xrpusd",
     "SOL": "pf_solusd",
+    "DOGE": "pf_dogeusd",
 }
 
 # Execution Constants
-MAX_STEPS = 30          # 30 Limit Order updates (Total 5 mins)
-STEP_INTERVAL = 10      # 10 seconds per step
+MAX_STEPS = 8           # 8 Limit Order updates
+STEP_INTERVAL = 5       # 5 seconds per step
 INITIAL_OFFSET = 0.0002 # 0.02% start offset
 OFFSET_DECAY = 0.90     # Decay offset
 SL_PCT = 0.01           # 1% Stop Loss
