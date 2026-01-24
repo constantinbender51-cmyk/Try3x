@@ -54,8 +54,8 @@ SYMBOL_MAP = {
 }
 
 # Execution Constants
-MAX_STEPS = 8           # 8 Limit Order updates
-STEP_INTERVAL = 5       # 5 seconds per step
+MAX_STEPS = 30          # 30 Limit Order updates (Total 5 mins)
+STEP_INTERVAL = 10      # 10 seconds per step
 INITIAL_OFFSET = 0.0002 # 0.02% start offset
 OFFSET_DECAY = 0.90     # Decay offset
 SL_PCT = 0.01           # 1% Stop Loss
