@@ -5,6 +5,7 @@ Try3: Execution Engine with SL/TP
 - Logic: Model2xx (Entry) + 1% SL / 2% TP (Bracket)
 - Signals: Multi-URL (try3{asset})
 - Schedule: Hourly @ :15s
+- Feature: Skip Asset List
 """
 
 import os
@@ -36,8 +37,11 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-LEVERAGE = 5
-MAX_WORKERS = 4  # Increased for BTC, XRP, SOL, DOGE
+LEVERAGE = 1.0
+MAX_WORKERS = 4  # BTC, XRP, SOL, DOGE
+
+# Skip List: Add symbols here to ignore them during execution (e.g. ["DOGE", "XRP"])
+SKIP_ASSETS = ["BTC", "XRP", "SOL"] 
 
 # Signal Sources
 SIGNAL_URLS = {
@@ -56,8 +60,8 @@ SYMBOL_MAP = {
 }
 
 # Execution Constants
-MAX_STEPS = 8           # 8 Limit Order updates
-STEP_INTERVAL = 5       # 5 seconds per step
+MAX_STEPS = 30          # 30 Limit Order updates (Total 5 mins)
+STEP_INTERVAL = 10      # 10 seconds per step
 INITIAL_OFFSET = 0.0002 # 0.02% start offset
 OFFSET_DECAY = 0.90     # Decay offset
 SL_PCT = 0.01           # 1% Stop Loss
@@ -81,13 +85,12 @@ def bot_log(msg, level="info"):
 # --- Signal Fetcher ---
 
 class MultiSourceFetcher:
-    def fetch_signals(self) -> Tuple[Dict[str, Any], int]:
+    def fetch_signals(self) -> Dict[str, Any]:
         """
         Fetches signals including entry_price.
-        Returns: ({ 'BTC': {'dir': 1, 'entry': 90000}, ... }, valid_count)
+        Returns: { 'BTC': {'dir': 1, 'entry': 90000}, ... }
         """
         votes = {}
-        valid_count = 0
         
         bot_log(f"Fetching signals for {list(SIGNAL_URLS.keys())}...")
 
@@ -104,7 +107,6 @@ class MultiSourceFetcher:
                         "dir": direction,
                         "entry": entry_price
                     }
-                    if direction != 0: valid_count += 1
                     
                     bot_log(f"[{asset}] Sig: {direction} @ {entry_price} (Matches: {data.get('matches', '?')})")
                 else:
@@ -112,7 +114,7 @@ class MultiSourceFetcher:
             except Exception as e:
                 bot_log(f"[{asset}] Fetch Failed: {e}", level="error")
         
-        return votes, valid_count
+        return votes
 
 # --- Main Engine ---
 
@@ -125,6 +127,9 @@ class Try3Bot:
 
     def initialize(self):
         bot_log("--- Initializing Try3 Bot (Hourly + SL/TP) ---")
+        if SKIP_ASSETS:
+            bot_log(f"WARNING: Skipping Assets: {SKIP_ASSETS}")
+
         self._fetch_instrument_specs()
         
         try:
@@ -196,11 +201,18 @@ class Try3Bot:
             time.sleep(1)
 
     def _process_cycle(self):
-        # 1. Fetch Signals
-        votes, active_count = self.fetcher.fetch_signals()
-        if active_count == 0: active_count = 1 # Avoid div/0 if rebalancing 0 assets
+        # 1. Fetch Raw Signals
+        raw_votes = self.fetcher.fetch_signals()
+        
+        # 2. Filter out SKIPPED assets
+        votes = {k: v for k, v in raw_votes.items() if k not in SKIP_ASSETS}
+        
+        # 3. Calculate Active Count (only non-skipped, non-zero direction)
+        active_count = sum(1 for v in votes.values() if v["dir"] != 0)
+        
+        if active_count == 0: active_count = 1 
 
-        # 2. Get Account Equity
+        # 4. Get Account Equity
         try:
             acc = self.kf.get_accounts()
             if "flex" in acc.get("accounts", {}):
@@ -216,12 +228,11 @@ class Try3Bot:
             bot_log(f"Account fetch failed: {e}", level="error")
             return
 
-        # 3. Calculate Base Unit
-        # Modified: Set position size to marginEquity * leverage directly
-        unit_usd = equity * LEVERAGE
-        bot_log(f"Equity: ${equity:.2f} | Active Assets: {active_count} | Unit Size: ${unit_usd:.2f}")
+        # 5. Calculate Base Unit
+        unit_usd = (equity * LEVERAGE) / active_count if active_count > 0 else 0
+        bot_log(f"Equity: ${equity:.2f} | Active Assets: {active_count} (Skipped: {SKIP_ASSETS})")
 
-        # 4. Execute concurrently
+        # 6. Execute concurrently
         for asset, data in votes.items():
             if asset not in SYMBOL_MAP: continue
                 
