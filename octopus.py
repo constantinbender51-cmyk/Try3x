@@ -41,7 +41,7 @@ LEVERAGE = 1.0
 MAX_WORKERS = 4  # BTC, XRP, SOL, DOGE
 
 # Skip List: Add symbols here to ignore them during execution (e.g. ["DOGE", "XRP"])
-SKIP_ASSETS = ["BTC", "XRP", "SOL"] 
+SKIP_ASSETS = [] 
 
 # Signal Sources
 SIGNAL_URLS = {
