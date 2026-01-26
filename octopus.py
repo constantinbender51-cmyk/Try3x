@@ -36,7 +36,7 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-LEVERAGE = 1.0
+LEVERAGE = 50
 MAX_WORKERS = 10  # Increased for multi-asset coverage
 
 # Skip List: Add symbols here to ignore them during execution
