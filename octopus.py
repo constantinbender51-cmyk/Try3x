@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Try3: Execution Engine with SL/TP
-- Base: Octopus (Architecture)
+Try4: Execution Engine with SL/TP (Adapted for Machine Learning Server)
+- Source: https://machine-learning.up.railway.app/api/signals
 - Logic: Model2xx (Entry) + 1% SL / 2% TP (Bracket)
-- Signals: Multi-URL (try3{asset})
-- Schedule: Hourly @ :15s
-- Feature: Skip Asset List
+- Schedule: Every 15 mins (00, 15, 30, 45) @ :15s
+- Assets: 15 Multi-Asset Support
 """
 
 import os
@@ -38,25 +37,33 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
 LEVERAGE = 1.0
-MAX_WORKERS = 4  # BTC, XRP, SOL, DOGE
+MAX_WORKERS = 10  # Increased for multi-asset coverage
 
-# Skip List: Add symbols here to ignore them during execution (e.g. ["DOGE", "XRP"])
+# Skip List: Add symbols here to ignore them during execution
 SKIP_ASSETS = [] 
 
-# Signal Sources
-SIGNAL_URLS = {
-    "BTC": "https://try3btc.up.railway.app/api/current",
-    "XRP": "https://try3xrp.up.railway.app/api/current",
-    "SOL": "https://try3sol.up.railway.app/api/current",
-    "DOGE": "https://try3doge.up.railway.app/api/current"
-}
+# Signal Source
+SIGNAL_URL = "https://machine-learning.up.railway.app/api/signals"
 
-# Asset Mapping (Internal Symbol -> Kraken Futures Symbol)
+# Asset Mapping (Binance Symbol from Server -> Kraken Futures Symbol)
+# Note: Kraken symbols are usually lower case 'pf_'. 
+# Ensure these exist on your specific Kraken Futures feed.
 SYMBOL_MAP = {
-    "BTC": "pf_xbtusd",
-    "XRP": "pf_xrpusd",
-    "SOL": "pf_solusd",
-    "DOGE": "pf_dogeusd",
+    "BTCUSDT": "pf_xbtusd",
+    "ETHUSDT": "pf_ethusd",
+    "XRPUSDT": "pf_xrpusd",
+    "SOLUSDT": "pf_solusd",
+    "DOGEUSDT": "pf_dogeusd",
+    "ADAUSDT": "pf_adausd",
+    "BCHUSDT": "pf_bchusd",
+    "LINKUSDT": "pf_linkusd",
+    "XLMUSDT": "pf_xlmusd",
+    "SUIUSDT": "pf_suiusd",
+    "AVAXUSDT": "pf_avaxusd",
+    "LTCUSDT": "pf_ltcusd",
+    "HBARUSDT": "pf_hbarusd",
+    "SHIBUSDT": "pf_shibusd", # Verify if 1000SHIB or SHIB on your feed
+    "TONUSDT": "pf_tonusd"
 }
 
 # Execution Constants
@@ -71,9 +78,9 @@ TP_PCT = 0.02           # 2% Take Profit
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
-    handlers=[logging.FileHandler("try3.log"), logging.StreamHandler(sys.stdout)]
+    handlers=[logging.FileHandler("try4.log"), logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("Try3")
+logger = logging.getLogger("Try4")
 LOG_LOCK = threading.Lock()
 
 def bot_log(msg, level="info"):
@@ -84,49 +91,59 @@ def bot_log(msg, level="info"):
 
 # --- Signal Fetcher ---
 
-class MultiSourceFetcher:
+class CentralSignalFetcher:
     def fetch_signals(self) -> Dict[str, Any]:
         """
-        Fetches signals including entry_price.
-        Returns: { 'BTC': {'dir': 1, 'entry': 90000}, ... }
+        Fetches signals from the central ML server.
+        Expected format: 
+        { 
+          "BTCUSDT": { "direction": "UP", "entry_price": 50000, ... }, 
+          "ETHUSDT": { ... } 
+        }
         """
         votes = {}
         
-        bot_log(f"Fetching signals for {list(SIGNAL_URLS.keys())}...")
+        bot_log(f"Fetching signals from {SIGNAL_URL}...")
 
-        for asset, url in SIGNAL_URLS.items():
-            try:
-                resp = requests.get(url, timeout=5)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    # Parse Direction and Entry Price
-                    direction = int(data.get("pred_dir", 0))
-                    entry_price = float(data.get("entry_price", 0.0))
+        try:
+            resp = requests.get(SIGNAL_URL, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                
+                for symbol, signal in data.items():
+                    # Parse Direction
+                    raw_dir = signal.get("direction", "FLAT")
+                    direction = 0
+                    if raw_dir == "UP": direction = 1
+                    elif raw_dir == "DOWN": direction = -1
                     
-                    votes[asset] = {
-                        "dir": direction,
-                        "entry": entry_price
-                    }
+                    # Parse Entry
+                    entry_price = float(signal.get("entry_price", 0.0))
                     
-                    bot_log(f"[{asset}] Sig: {direction} @ {entry_price} (Matches: {data.get('matches', '?')})")
-                else:
-                    bot_log(f"[{asset}] HTTP Error {resp.status_code}", level="warning")
-            except Exception as e:
-                bot_log(f"[{asset}] Fetch Failed: {e}", level="error")
+                    if direction != 0:
+                        votes[symbol] = {
+                            "dir": direction,
+                            "entry": entry_price
+                        }
+                        bot_log(f"[{symbol}] Sig: {raw_dir} @ {entry_price}")
+            else:
+                bot_log(f"HTTP Error {resp.status_code}", level="warning")
+        except Exception as e:
+            bot_log(f"Fetch Failed: {e}", level="error")
         
         return votes
 
 # --- Main Engine ---
 
-class Try3Bot:
+class Try4Bot:
     def __init__(self):
         self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
-        self.fetcher = MultiSourceFetcher()
+        self.fetcher = CentralSignalFetcher()
         self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
         self.instrument_specs = {}
 
     def initialize(self):
-        bot_log("--- Initializing Try3 Bot (Hourly + SL/TP) ---")
+        bot_log("--- Initializing Try4 Bot (15m Cycle + Multi-Asset) ---")
         if SKIP_ASSETS:
             bot_log(f"WARNING: Skipping Assets: {SKIP_ASSETS}")
 
@@ -191,23 +208,31 @@ class Try3Bot:
             return 0.0, 0.0
 
     def run(self):
-        bot_log("Bot started. Syncing to XX:00:15...")
+        bot_log("Bot started. Syncing to 15m intervals (00, 15, 30, 45)...")
         while True:
             now = datetime.now(timezone.utc)
-            if now.minute == 0 and 15 <= now.second < 20:
+            # Trigger on 15 minute boundaries at :15 seconds
+            if now.minute % 15 == 0 and 15 <= now.second < 20:
                 bot_log(f">>> TRIGGER: {now.strftime('%H:%M:%S')} <<<")
                 self._process_cycle()
-                time.sleep(50) 
+                time.sleep(50) # Prevent double trigger
             time.sleep(1)
 
     def _process_cycle(self):
         # 1. Fetch Raw Signals
         raw_votes = self.fetcher.fetch_signals()
         
-        # 2. Filter out SKIPPED assets
-        votes = {k: v for k, v in raw_votes.items() if k not in SKIP_ASSETS}
-        
-        # 3. Calculate Active Count (only non-skipped, non-zero direction)
+        # 2. Filter out SKIPPED assets and Map to Kraken Symbols
+        votes = {}
+        for binance_sym, data in raw_votes.items():
+            if binance_sym in SKIP_ASSETS: continue
+            if binance_sym in SYMBOL_MAP:
+                votes[binance_sym] = data # Keep binance key for reference, map later
+            else:
+                # Optional: Log missing map if needed
+                pass
+
+        # 3. Calculate Active Count (only non-zero direction)
         active_count = sum(1 for v in votes.values() if v["dir"] != 0)
         
         if active_count == 0: active_count = 1 
@@ -230,16 +255,21 @@ class Try3Bot:
 
         # 5. Calculate Base Unit
         unit_usd = (equity * LEVERAGE) / active_count if active_count > 0 else 0
-        bot_log(f"Equity: ${equity:.2f} | Active Assets: {active_count} (Skipped: {SKIP_ASSETS})")
+        bot_log(f"Equity: ${equity:.2f} | Active Assets: {active_count} | Unit: ${unit_usd:.2f}")
 
         # 6. Execute concurrently
-        for asset, data in votes.items():
-            if asset not in SYMBOL_MAP: continue
+        for binance_sym, data in votes.items():
+            if binance_sym not in SYMBOL_MAP: continue
                 
-            kf_symbol = SYMBOL_MAP[asset]
+            kf_symbol = SYMBOL_MAP[binance_sym]
             direction = data["dir"]
             entry_price = data["entry"]
             target_usd = unit_usd * direction
+
+            # If the spec doesn't exist (e.g. unsupported asset on this account), skip safely
+            if kf_symbol.upper() not in self.instrument_specs:
+                bot_log(f"[{kf_symbol}] Specs not found. Skipping.", level="warning")
+                continue
 
             self.executor.submit(self._execute_dynamic_sequence, kf_symbol, target_usd, entry_price)
 
@@ -337,7 +367,8 @@ class Try3Bot:
         side = "sell" if is_long else "buy"
         abs_size = abs(position_size)
 
-        # Calculate Prices based on SIGNAL ENTRY PRICE
+        # Calculate Prices based on SIGNAL ENTRY PRICE (from the server)
+        # Using server entry price ensures alignment with the strategy logic
         if is_long:
             sl_price = entry_price * (1 - SL_PCT) # 1% below entry
             tp_price = entry_price * (1 + TP_PCT) # 2% above entry
@@ -370,7 +401,7 @@ class Try3Bot:
                 "symbol": symbol, 
                 "side": side, 
                 "size": abs_size, 
-                "stopPrice": tp_price, # Kraken 'stopPrice' acts as trigger for TP too
+                "stopPrice": tp_price, 
                 "reduceOnly": True
             })
         except Exception as e:
@@ -381,6 +412,6 @@ class Try3Bot:
         except: pass
 
 if __name__ == "__main__":
-    bot = Try3Bot()
+    bot = Try4Bot()
     bot.initialize()
     bot.run()
